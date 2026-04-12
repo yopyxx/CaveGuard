@@ -56,9 +56,10 @@ const TIMEOUT_MS_SPAM = 7 * 24 * 60 * 60 * 1000; // 1주
 const TIMEOUT_MS_NUKE = 7 * 24 * 60 * 60 * 1000; // 1주
 
 const NUKE_WINDOW_MS = 30 * 1000;
-const NUKE_ROLE_DELETE_THRESHOLD = 1; // 역할 관리 권한 보유자가 삭제하면 즉시 조치
+const NUKE_ROLE_DELETE_THRESHOLD = 1;
 
 const AUTO_BACKUP_INTERVAL_MINUTES = 5;
+const ROLE_WATCH_INTERVAL_SECONDS = 10; // 역할 삭제 감지용 주기 스캔
 const RISK_LOG_KEEP_DAYS = 60;
 const RECENT_CHANNEL_SCAN_LIMIT = 8;
 
@@ -271,6 +272,7 @@ const client = new Client({
 
 const spamTracker = new Collection();
 const recentUserChannels = new Collection();
+const roleStateCache = new Map(); // guildId -> Map(roleId, snapshot)
 
 /* =========================
    슬래시 명령어
@@ -278,12 +280,12 @@ const recentUserChannels = new Collection();
 const commands = [
   new SlashCommandBuilder()
     .setName("삭제된역할")
-    .setDescription("삭제된 서버 역할 목록을 확인합니다.")
+    .setDescription("삭제된 역할 목록을 확인합니다.")
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 
   new SlashCommandBuilder()
     .setName("역할복구")
-    .setDescription("삭제된 서버 역할 중 특정 역할만 복구합니다. 이름 또는 목록 번호를 입력할 수 있습니다.")
+    .setDescription("삭제된 역할 중 특정 역할만 복구합니다. 이름 또는 목록 번호를 입력할 수 있습니다.")
     .addStringOption((opt) =>
       opt
         .setName("식별자")
@@ -294,7 +296,7 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName("역할전체복구")
-    .setDescription("삭제된 서버 역할을 전부 복구합니다.")
+    .setDescription("삭제된 역할을 전부 복구합니다.")
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 
   new SlashCommandBuilder()
@@ -423,6 +425,7 @@ async function backupAllRoles(guild) {
   }
 
   setRoleBackupData(data);
+  rebuildRoleStateCacheForGuild(guild, data);
   return Object.keys(data.roles).length;
 }
 
@@ -469,9 +472,13 @@ async function syncSingleRoleSnapshot(guild, role) {
 
   backup.savedAt = nowISO();
   setRoleBackupData(backup);
+
+  const guildMap = roleStateCache.get(guild.id) || new Map();
+  guildMap.set(role.id, JSON.parse(JSON.stringify(backup.roles[role.id])));
+  roleStateCache.set(guild.id, guildMap);
 }
 
-function markRoleDeletedOrCreateSnapshot(guild, role) {
+function markRoleDeletedOrCreateSnapshot(guild, role, reasonText = null) {
   const backup = ensureBackupRoot(guild.id);
   const old = backup.roles[role.id];
 
@@ -491,6 +498,9 @@ function markRoleDeletedOrCreateSnapshot(guild, role) {
     old.restoredAt = null;
     old.lastSyncedAt = nowISO();
     if (!Array.isArray(old.restoreFailures)) old.restoreFailures = [];
+    if (reasonText && !old.restoreFailures.includes(reasonText)) {
+      old.restoreFailures.unshift(reasonText);
+    }
   } else {
     backup.roles[role.id] = {
       oldRoleId: role.id,
@@ -509,7 +519,7 @@ function markRoleDeletedOrCreateSnapshot(guild, role) {
       restoredAt: null,
       isDeleted: true,
       restoreFailures: [
-        "삭제 전 백업 데이터가 없어 역할 보유자 목록을 복구하지 못했습니다.",
+        reasonText || "삭제 전 백업 데이터가 없어 역할 보유자 목록을 복구하지 못했습니다.",
       ],
       lastSyncedAt: nowISO(),
     };
@@ -517,6 +527,10 @@ function markRoleDeletedOrCreateSnapshot(guild, role) {
 
   backup.savedAt = nowISO();
   setRoleBackupData(backup);
+
+  const guildMap = roleStateCache.get(guild.id) || new Map();
+  guildMap.delete(role.id);
+  roleStateCache.set(guild.id, guildMap);
 }
 
 async function syncMemberRolesToSnapshots(member) {
@@ -556,6 +570,68 @@ async function syncMemberRolesToSnapshots(member) {
     backup.savedAt = nowISO();
     setRoleBackupData(backup);
   }
+}
+
+function rebuildRoleStateCacheForGuild(guild, backup = null) {
+  const source = backup || getRoleBackupData();
+  const guildMap = new Map();
+
+  for (const [roleId, snap] of Object.entries(source.roles || {})) {
+    if (snap?.isDeleted) continue;
+    guildMap.set(roleId, JSON.parse(JSON.stringify(snap)));
+  }
+
+  roleStateCache.set(guild.id, guildMap);
+}
+
+async function detectDeletedRolesByScan(guild) {
+  await guild.roles.fetch().catch(() => null);
+
+  const currentRoleIds = new Set(
+    guild.roles.cache
+      .filter((role) => role.id !== guild.id && !role.managed)
+      .map((role) => role.id)
+  );
+
+  const cached = roleStateCache.get(guild.id) || new Map();
+  const deleted = [];
+
+  for (const [roleId, oldSnapshot] of cached.entries()) {
+    if (!currentRoleIds.has(roleId)) {
+      deleted.push(oldSnapshot);
+    }
+  }
+
+  if (!deleted.length) return 0;
+
+  for (const oldSnapshot of deleted) {
+    markRoleDeletedOrCreateSnapshot(
+      guild,
+      {
+        id: oldSnapshot.oldRoleId,
+        name: oldSnapshot.name,
+        color: oldSnapshot.color,
+        permissions: { bitfield: BigInt(oldSnapshot.permissions) },
+        hoist: oldSnapshot.hoist,
+        mentionable: oldSnapshot.mentionable,
+        position: oldSnapshot.position,
+        managed: oldSnapshot.managed,
+        icon: oldSnapshot.icon || null,
+        unicodeEmoji: oldSnapshot.unicodeEmoji || null,
+      },
+      "주기 스캔으로 삭제된 역할을 감지했습니다."
+    );
+
+    console.log(`[역할스캔감지] 삭제된 역할 기록 반영: ${oldSnapshot.name} (${oldSnapshot.oldRoleId})`);
+  }
+
+  const updatedMap = roleStateCache.get(guild.id) || new Map();
+  for (const oldSnapshot of deleted) {
+    updatedMap.delete(oldSnapshot.oldRoleId);
+  }
+  roleStateCache.set(guild.id, updatedMap);
+
+  return deleted.length;
 }
 
 /* =========================
@@ -681,6 +757,10 @@ async function restoreSingleDeletedRole(guild, identifier) {
   snapshot.restoreFailures = [...failures, ...assignFailures];
   setRoleBackupData(backup);
 
+  const guildMap = roleStateCache.get(guild.id) || new Map();
+  guildMap.set(newRole.id, JSON.parse(JSON.stringify(snapshot)));
+  roleStateCache.set(guild.id, guildMap);
+
   return {
     ok: true,
     roleName: snapshot.name,
@@ -748,6 +828,10 @@ async function restoreAllDeletedRoles(guild) {
         assignedCount,
         failureCount: snapshot.restoreFailures.length,
       });
+
+      const guildMap = roleStateCache.get(guild.id) || new Map();
+      guildMap.set(newRole.id, JSON.parse(JSON.stringify(snapshot)));
+      roleStateCache.set(guild.id, guildMap);
     } catch (err) {
       console.error(`역할 복구 실패: ${snapshot.name}`, err);
       skipped.push({ name: snapshot.name, reason: err.message || "복구 중 오류 발생" });
@@ -1054,7 +1138,7 @@ client.on("guildRoleDelete", async (role) => {
     console.log(`[guildRoleDelete 감지] ${role.name} (${role.id})`);
 
     try {
-      markRoleDeletedOrCreateSnapshot(guild, role);
+      markRoleDeletedOrCreateSnapshot(guild, role, "guildRoleDelete 이벤트로 삭제를 감지했습니다.");
 
       const backup = getRoleBackupData();
       const deletedCount = Object.values(backup.roles || {}).filter(
@@ -1084,62 +1168,15 @@ client.on("guildRoleDelete", async (role) => {
       });
     } catch (err) {
       console.error("[감사로그조회실패] guildRoleDelete:", err);
-
-      const embed = new EmbedBuilder()
-        .setTitle("역할 삭제 감지")
-        .setColor(0xffcc00)
-        .setDescription(
-          [
-            `삭제된 역할: ${role.name}`,
-            `역할 ID: ${role.id}`,
-            `실행자: 감사로그 조회 실패`,
-            `삭제 기록 저장: 완료`,
-            `처리 시각: ${nowISO()}`,
-          ].join("\n")
-        );
-
-      await sendLog(guild, embed);
       return;
     }
 
-    if (!entry) {
-      const embed = new EmbedBuilder()
-        .setTitle("역할 삭제 감지")
-        .setColor(0xffcc00)
-        .setDescription(
-          [
-            `삭제된 역할: ${role.name}`,
-            `역할 ID: ${role.id}`,
-            `실행자: 확인 실패`,
-            `삭제 기록 저장: 완료`,
-            `처리 시각: ${nowISO()}`,
-          ].join("\n")
-        );
-
-      await sendLog(guild, embed);
-      return;
-    }
+    if (!entry) return;
 
     const executorId = entry.executor?.id;
     if (!executorId) return;
 
     const executor = await guild.members.fetch({ user: executorId, force: true }).catch(() => null);
-
-    const baseEmbed = new EmbedBuilder()
-      .setTitle("역할 삭제 감지")
-      .setColor(0xff3b30)
-      .setDescription(
-        [
-          `삭제된 역할: ${role.name}`,
-          `역할 ID: ${role.id}`,
-          `실행자: <@${executorId}>`,
-          `삭제 기록 저장: 완료`,
-          `처리 시각: ${nowISO()}`,
-        ].join("\n")
-      );
-
-    await sendLog(guild, baseEmbed);
-
     if (!executor) return;
     if (isProtectedUser(executor)) return;
 
@@ -1187,25 +1224,6 @@ client.on("guildRoleDelete", async (role) => {
       releasedAt: null,
     });
     setRiskLogData(risk);
-
-    const punishEmbed = new EmbedBuilder()
-      .setTitle("안티누크 자동 조치")
-      .setColor(0xff0000)
-      .setDescription(
-        [
-          `대상: <@${executor.id}>`,
-          `사유: 역할 관리 권한 보유 상태에서 서버 역할 삭제`,
-          `삭제한 역할: ${role.name}`,
-          `최근 ${NUKE_WINDOW_MS / 1000}초 내 역할 삭제 횟수: ${nukeCount}`,
-          `박탈된 관리 역할 수: ${removedRoles.length}`,
-          `타임아웃 적용: ${timeoutOk ? "성공" : "실패"}`,
-          `격리 역할 적용: ${quarantine.ok ? "성공" : `실패 (${quarantine.reason})`}`,
-          `부가 실패 수: ${removeFailures.length}`,
-          `처리 시각: ${nowISO()}`,
-        ].join("\n")
-      );
-
-    await sendLog(guild, punishEmbed);
   } catch (err) {
     console.error("guildRoleDelete 처리 오류:", err);
   }
@@ -1243,7 +1261,6 @@ client.on("interactionCreate", async (interaction) => {
 
       if (deleted.length === 0) {
         const backup = getRoleBackupData();
-
         return interaction.reply({
           content:
             "현재 삭제된 역할 기록이 없습니다.\n" +
@@ -1264,7 +1281,7 @@ client.on("interactionCreate", async (interaction) => {
       });
 
       const embed = new EmbedBuilder()
-        .setTitle("삭제된 서버 역할 목록")
+        .setTitle("삭제된 역할 목록")
         .setColor(0xff9500)
         .setDescription(lines.join("\n\n"));
 
@@ -1491,9 +1508,10 @@ client.on("interactionCreate", async (interaction) => {
 });
 
 /* =========================
-   자동 전체 백업
+   자동 전체 백업 / 역할 감시
 ========================= */
 let backupInterval = null;
+let roleWatchInterval = null;
 
 async function startAutoBackup() {
   if (backupInterval) clearInterval(backupInterval);
@@ -1514,6 +1532,27 @@ async function startAutoBackup() {
       console.error("[자동백업] 실패:", err);
     }
   }, AUTO_BACKUP_INTERVAL_MINUTES * 60 * 1000);
+}
+
+async function startRoleWatcher() {
+  if (roleWatchInterval) clearInterval(roleWatchInterval);
+
+  roleWatchInterval = setInterval(async () => {
+    try {
+      const guild =
+        client.guilds.cache.get(GUILD_ID) ||
+        await client.guilds.fetch(GUILD_ID).catch(() => null);
+
+      if (!guild) return;
+
+      const detected = await detectDeletedRolesByScan(guild);
+      if (detected > 0) {
+        console.log(`[역할감시] 삭제된 역할 ${detected}개 반영 완료`);
+      }
+    } catch (err) {
+      console.error("[역할감시] 실패:", err);
+    }
+  }, ROLE_WATCH_INTERVAL_SECONDS * 1000);
 }
 
 /* =========================
@@ -1537,6 +1576,7 @@ client.once("ready", async () => {
 
     if (guild) {
       const count = await backupAllRoles(guild);
+      rebuildRoleStateCacheForGuild(guild);
       console.log(`[시작자동저장] 역할 ${count}개 저장 완료`);
     } else {
       console.error("[시작자동저장] 길드를 찾지 못했습니다.");
@@ -1546,6 +1586,7 @@ client.once("ready", async () => {
   }
 
   await startAutoBackup();
+  await startRoleWatcher();
 });
 
 /* =========================
