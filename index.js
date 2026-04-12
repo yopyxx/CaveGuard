@@ -25,32 +25,23 @@ const TOKEN = RAW_TOKEN.replace(/^Bot\s+/i, "").trim();
 const CLIENT_ID = (process.env.CLIENT_ID || "").trim();
 const GUILD_ID = (process.env.GUILD_ID || "").trim();
 const LOG_CHANNEL_ID = (process.env.LOG_CHANNEL_ID || "").trim();
-
-// 격리 역할 ID (선택)
-// 이 역할은 서버에서 미리 만들어두고,
-// 모든 주요 채널에서 보기/쓰기 금지되도록 설정하는 것을 권장
 const QUARANTINE_ROLE_ID = (process.env.QUARANTINE_ROLE_ID || "").trim();
 
 /* =========================
    보호/예외 설정
 ========================= */
-
-// 절대 자동 제재하지 않을 유저
 const SUPER_ADMIN_IDS = new Set([
   // "123456789012345678",
 ]);
 
-// 절대 자동 제재하지 않을 역할
 const PROTECTED_ROLE_IDS = new Set([
   // "123456789012345678",
 ]);
 
-// 초대 링크 스팸 감지 예외 채널
 const SAFE_INVITE_CHANNEL_IDS = new Set([
   // "123456789012345678",
 ]);
 
-// 초대 링크 스팸 감지 예외 역할
 const SAFE_INVITE_ROLE_IDS = new Set([
   // "123456789012345678",
 ]);
@@ -58,24 +49,16 @@ const SAFE_INVITE_ROLE_IDS = new Set([
 /* =========================
    설정값
 ========================= */
+const SPAM_WINDOW_MS = 15 * 1000;
+const SPAM_LINK_THRESHOLD = 3;
+const TIMEOUT_MS_SPAM = 30 * 60 * 1000;
 
-// 안티스팸
-const SPAM_WINDOW_MS = 15 * 1000;        // 15초
-const SPAM_LINK_THRESHOLD = 3;           // 15초 내 3개 이상
-const TIMEOUT_MS_SPAM = 30 * 60 * 1000;  // 30분
+const TIMEOUT_MS_NUKE = 7 * 24 * 60 * 60 * 1000;
+const NUKE_WINDOW_MS = 30 * 1000;
+const NUKE_ROLE_DELETE_THRESHOLD = 2;
 
-// 안티누크
-const TIMEOUT_MS_NUKE = 7 * 24 * 60 * 60 * 1000; // 1주
-const NUKE_WINDOW_MS = 30 * 1000;                // 30초
-const NUKE_ROLE_DELETE_THRESHOLD = 2;            // 30초 내 역할 삭제 2회 이상
-
-// 역할 자동 백업 주기 (분)
 const AUTO_BACKUP_INTERVAL_MINUTES = 10;
-
-// 로그 보존 일수
 const RISK_LOG_KEEP_DAYS = 60;
-
-// 메시지 정리 시 최근 탐색 채널 수
 const RECENT_CHANNEL_SCAN_LIMIT = 8;
 
 /* =========================
@@ -120,17 +103,9 @@ function normalizeText(text) {
   if (!text) return "";
   return String(text)
     .normalize("NFKC")
-    .replace(/[\u200B-\u200D\uFEFF]/g, "") // zero-width 제거
+    .replace(/[\u200B-\u200D\uFEFF]/g, "")
     .replace(/\s+/g, " ")
     .trim();
-}
-
-function escapeRegExp(str) {
-  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function parseBool(value) {
-  return ["1", "true", "yes", "y", "on"].includes(String(value).toLowerCase());
 }
 
 function isDiscordInviteLike(content) {
@@ -143,15 +118,6 @@ function isDiscordInviteLike(content) {
     /discordapp\.com\/invite\/[a-z0-9-]+/i.test(text) ||
     /d1scord|disc0rd|dlscord|d1sc0rd|discord-gift|steamcommunity\.gift|nitro/i.test(text)
   );
-}
-
-function isChannelSafeForInvite(channelId) {
-  return SAFE_INVITE_CHANNEL_IDS.has(channelId);
-}
-
-function memberHasAnyRole(member, roleIds) {
-  if (!member) return false;
-  return [...roleIds].some((id) => member.roles.cache.has(id));
 }
 
 function hasAdministrator(member) {
@@ -172,8 +138,9 @@ function hasHighRiskPerms(member) {
     member.permissions.has(PermissionFlagsBits.ModerateMembers);
 }
 
-function getManageRolesOnly(member) {
-  return hasManageRoles(member) && !hasAdministrator(member);
+function memberHasAnyRole(member, roleIds) {
+  if (!member) return false;
+  return [...roleIds].some((id) => member.roles.cache.has(id));
 }
 
 function isProtectedUser(member) {
@@ -209,6 +176,7 @@ function roleToSnapshot(role, membersWithRole = []) {
     restoredAt: null,
     isDeleted: false,
     restoreFailures: [],
+    lastSyncedAt: nowISO(),
   };
 }
 
@@ -381,7 +349,7 @@ async function registerCommands() {
 }
 
 /* =========================
-   역할 백업
+   역할 백업/동기화 헬퍼
 ========================= */
 async function backupAllRoles(guild) {
   await guild.roles.fetch().catch(() => null);
@@ -409,6 +377,138 @@ async function backupAllRoles(guild) {
 
   setRoleBackupData(data);
   return Object.keys(data.roles).length;
+}
+
+function ensureBackupRoot(guildId) {
+  const backup = getRoleBackupData();
+  if (!backup.guildId) backup.guildId = guildId;
+  if (!backup.roles) backup.roles = {};
+  return backup;
+}
+
+async function syncSingleRoleSnapshot(guild, role) {
+  if (!guild || !role) return;
+  if (role.id === guild.id) return;
+  if (role.managed) return;
+
+  const backup = ensureBackupRoot(guild.id);
+
+  await guild.members.fetch().catch(() => null);
+
+  const memberIds = guild.members.cache
+    .filter((member) => member.roles.cache.has(role.id))
+    .map((member) => member.id);
+
+  const old = backup.roles[role.id] || {};
+  backup.roles[role.id] = {
+    oldRoleId: role.id,
+    name: role.name,
+    color: role.color,
+    permissions: role.permissions.bitfield.toString(),
+    hoist: role.hoist,
+    mentionable: role.mentionable,
+    position: role.position,
+    managed: role.managed,
+    icon: role.icon || null,
+    unicodeEmoji: role.unicodeEmoji || null,
+    memberIds,
+    restoredRoleId: old.restoredRoleId || null,
+    deletedAt: null,
+    restoredAt: old.restoredAt || null,
+    isDeleted: false,
+    restoreFailures: old.restoreFailures || [],
+    lastSyncedAt: nowISO(),
+  };
+
+  backup.savedAt = nowISO();
+  setRoleBackupData(backup);
+}
+
+function markRoleDeletedOrCreateSnapshot(guild, role) {
+  const backup = ensureBackupRoot(guild.id);
+  const old = backup.roles[role.id];
+
+  if (old) {
+    old.name = role.name;
+    old.color = role.color;
+    old.permissions = role.permissions.bitfield.toString();
+    old.hoist = role.hoist;
+    old.mentionable = role.mentionable;
+    old.position = role.position;
+    old.managed = role.managed;
+    old.icon = role.icon || null;
+    old.unicodeEmoji = role.unicodeEmoji || null;
+    old.isDeleted = true;
+    old.deletedAt = nowISO();
+    old.restoredRoleId = null;
+    old.restoredAt = null;
+    old.lastSyncedAt = nowISO();
+    if (!Array.isArray(old.restoreFailures)) old.restoreFailures = [];
+  } else {
+    backup.roles[role.id] = {
+      oldRoleId: role.id,
+      name: role.name,
+      color: role.color,
+      permissions: role.permissions.bitfield.toString(),
+      hoist: role.hoist,
+      mentionable: role.mentionable,
+      position: role.position,
+      managed: role.managed,
+      icon: role.icon || null,
+      unicodeEmoji: role.unicodeEmoji || null,
+      memberIds: [],
+      restoredRoleId: null,
+      deletedAt: nowISO(),
+      restoredAt: null,
+      isDeleted: true,
+      restoreFailures: [
+        "삭제 전 백업 데이터가 없어 역할 보유자 목록을 복구하지 못했습니다.",
+      ],
+      lastSyncedAt: nowISO(),
+    };
+  }
+
+  backup.savedAt = nowISO();
+  setRoleBackupData(backup);
+}
+
+async function syncMemberRolesToSnapshots(member) {
+  if (!member?.guild) return;
+
+  const guild = member.guild;
+  const backup = ensureBackupRoot(guild.id);
+  let changed = false;
+
+  for (const role of guild.roles.cache.values()) {
+    if (role.id === guild.id) continue;
+    if (role.managed) continue;
+
+    if (!backup.roles[role.id]) {
+      backup.roles[role.id] = roleToSnapshot(role, []);
+      changed = true;
+    }
+
+    const snap = backup.roles[role.id];
+    if (!Array.isArray(snap.memberIds)) snap.memberIds = [];
+
+    const hasRole = member.roles.cache.has(role.id);
+    const exists = snap.memberIds.includes(member.id);
+
+    if (hasRole && !exists) {
+      snap.memberIds.push(member.id);
+      snap.lastSyncedAt = nowISO();
+      changed = true;
+    } else if (!hasRole && exists) {
+      snap.memberIds = snap.memberIds.filter((id) => id !== member.id);
+      snap.lastSyncedAt = nowISO();
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    backup.savedAt = nowISO();
+    setRoleBackupData(backup);
+  }
 }
 
 /* =========================
@@ -826,7 +926,7 @@ async function handleSpamMessage(message) {
   trackRecentChannel(message.guild.id, message.author.id, message.channelId);
 
   if (!isDiscordInviteLike(message.content)) return;
-  if (isChannelSafeForInvite(message.channelId)) return;
+  if (SAFE_INVITE_CHANNEL_IDS.has(message.channelId)) return;
 
   const member = message.member;
   if (!member) return;
@@ -910,6 +1010,61 @@ function pushNukeTracker(userId) {
 }
 
 /* =========================
+   역할 관련 이벤트 추가
+========================= */
+client.on("guildRoleCreate", async (role) => {
+  try {
+    await syncSingleRoleSnapshot(role.guild, role);
+
+    const embed = new EmbedBuilder()
+      .setTitle("역할 생성 감지")
+      .setColor(0x2ecc71)
+      .setDescription(
+        [
+          `역할명: ${role.name}`,
+          `역할 ID: ${role.id}`,
+          `백업 반영: 완료`,
+          `처리 시각: ${nowISO()}`,
+        ].join("\n")
+      );
+
+    await sendLog(role.guild, embed);
+  } catch (err) {
+    console.error("guildRoleCreate 처리 오류:", err);
+  }
+});
+
+client.on("guildRoleUpdate", async (oldRole, newRole) => {
+  try {
+    await syncSingleRoleSnapshot(newRole.guild, newRole);
+
+    const embed = new EmbedBuilder()
+      .setTitle("역할 수정 감지")
+      .setColor(0x3498db)
+      .setDescription(
+        [
+          `역할명: ${oldRole.name} -> ${newRole.name}`,
+          `역할 ID: ${newRole.id}`,
+          `백업 반영: 완료`,
+          `처리 시각: ${nowISO()}`,
+        ].join("\n")
+      );
+
+    await sendLog(newRole.guild, embed);
+  } catch (err) {
+    console.error("guildRoleUpdate 처리 오류:", err);
+  }
+});
+
+client.on("guildMemberUpdate", async (oldMember, newMember) => {
+  try {
+    await syncMemberRolesToSnapshots(newMember);
+  } catch (err) {
+    console.error("guildMemberUpdate 처리 오류:", err);
+  }
+});
+
+/* =========================
    역할 삭제 감지 + 안티누크
 ========================= */
 client.on("guildRoleDelete", async (role) => {
@@ -928,16 +1083,8 @@ client.on("guildRoleDelete", async (role) => {
       return targetId === role.id && Date.now() - created < 15000;
     });
 
-    // 백업 데이터에 삭제 표시
-    const backup = getRoleBackupData();
-    if (backup.roles?.[role.id]) {
-      backup.roles[role.id].isDeleted = true;
-      backup.roles[role.id].deletedAt = nowISO();
-      backup.roles[role.id].restoredRoleId = null;
-      backup.roles[role.id].restoredAt = null;
-      backup.roles[role.id].restoreFailures = [];
-      setRoleBackupData(backup);
-    }
+    // 삭제 기록 무조건 남기기
+    markRoleDeletedOrCreateSnapshot(guild, role);
 
     if (!entry) {
       const embed = new EmbedBuilder()
@@ -948,6 +1095,7 @@ client.on("guildRoleDelete", async (role) => {
             `삭제된 역할: ${role.name}`,
             `역할 ID: ${role.id}`,
             `실행자: 확인 실패`,
+            `삭제 기록 저장: 완료`,
             `처리 시각: ${nowISO()}`,
           ].join("\n")
         );
@@ -969,6 +1117,7 @@ client.on("guildRoleDelete", async (role) => {
           `삭제된 역할: ${role.name}`,
           `역할 ID: ${role.id}`,
           `실행자: <@${executorId}>`,
+          `삭제 기록 저장: 완료`,
           `처리 시각: ${nowISO()}`,
         ].join("\n")
       );
@@ -1119,7 +1268,8 @@ client.on("interactionCreate", async (interaction) => {
         return [
           `**${i + 1}. ${r.name}**`,
           `삭제시각: ${r.deletedAt || "기록 없음"}`,
-          `기존 역할 ID: ${r.oldRoleId || "없음"}`
+          `기존 역할 ID: ${r.oldRoleId || "없음"}`,
+          `보유자 수: ${(r.memberIds || []).length}명`,
         ].join("\n");
       });
 
