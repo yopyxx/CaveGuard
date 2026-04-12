@@ -51,9 +51,11 @@ const SAFE_INVITE_ROLE_IDS = new Set([
 ========================= */
 const SPAM_WINDOW_MS = 15 * 1000;
 const SPAM_LINK_THRESHOLD = 3;
-const TIMEOUT_MS_SPAM = 30 * 60 * 1000;
 
+// 스팸 / 누크 둘 다 1주일
+const TIMEOUT_MS_SPAM = 7 * 24 * 60 * 60 * 1000;
 const TIMEOUT_MS_NUKE = 7 * 24 * 60 * 60 * 1000;
+
 const NUKE_WINDOW_MS = 30 * 1000;
 const NUKE_ROLE_DELETE_THRESHOLD = 1; // 역할 관리 권한 보유자가 삭제하면 바로 조치
 
@@ -273,7 +275,6 @@ const recentUserChannels = new Collection();
 
 /* =========================
    슬래시 명령어
-   /역할저장 제거
 ========================= */
 const commands = [
   new SlashCommandBuilder()
@@ -349,11 +350,20 @@ const commands = [
 
 async function registerCommands() {
   const rest = new REST({ version: "10" }).setToken(TOKEN);
+
+  await rest.put(
+    Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID),
+    { body: [] }
+  );
+
+  await sleep(1000);
+
   await rest.put(
     Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID),
     { body: commands }
   );
-  console.log("슬래시 명령어 등록 완료");
+
+  console.log(`슬래시 명령어 등록 완료: ${commands.length}개`);
 }
 
 /* =========================
@@ -1012,7 +1022,6 @@ client.on("guildRoleDelete", async (role) => {
   try {
     const guild = role.guild;
 
-    // 삭제 기록은 무조건 먼저 저장
     try {
       markRoleDeletedOrCreateSnapshot(guild, role);
       console.log(`[삭제기록저장] 역할 삭제 기록 저장 완료: ${role.name} (${role.id})`);
@@ -1469,6 +1478,12 @@ client.once("ready", async () => {
   console.log(`로그인 완료: ${client.user.tag}`);
 
   try {
+    await registerCommands();
+  } catch (err) {
+    console.error("[명령어등록] 실패:", err);
+  }
+
+  try {
     pruneRiskLogData();
 
     const guild =
@@ -1478,6 +1493,8 @@ client.once("ready", async () => {
     if (guild) {
       const count = await backupAllRoles(guild);
       console.log(`[시작자동저장] 역할 ${count}개 저장 완료`);
+    } else {
+      console.error("[시작자동저장] 길드를 찾지 못했습니다.");
     }
   } catch (err) {
     console.error("[시작자동저장] 실패:", err);
@@ -1495,7 +1512,6 @@ client.once("ready", async () => {
       throw new Error("TOKEN / CLIENT_ID / GUILD_ID 환경변수를 설정하세요.");
     }
 
-    await registerCommands();
     await client.login(TOKEN);
   } catch (err) {
     console.error("봇 시작 실패:", err);
