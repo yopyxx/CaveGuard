@@ -55,9 +55,9 @@ const TIMEOUT_MS_SPAM = 30 * 60 * 1000;
 
 const TIMEOUT_MS_NUKE = 7 * 24 * 60 * 60 * 1000;
 const NUKE_WINDOW_MS = 30 * 1000;
-const NUKE_ROLE_DELETE_THRESHOLD = 2;
+const NUKE_ROLE_DELETE_THRESHOLD = 1; // 역할 관리 권한 보유자가 삭제하면 바로 조치
 
-const AUTO_BACKUP_INTERVAL_MINUTES = 10;
+const AUTO_BACKUP_INTERVAL_MINUTES = 5;
 const RISK_LOG_KEEP_DAYS = 60;
 const RECENT_CHANNEL_SCAN_LIMIT = 8;
 
@@ -124,20 +124,6 @@ function hasAdministrator(member) {
   return member.permissions.has(PermissionFlagsBits.Administrator);
 }
 
-function hasManageRoles(member) {
-  return member.permissions.has(PermissionFlagsBits.ManageRoles);
-}
-
-function hasHighRiskPerms(member) {
-  return member.permissions.has(PermissionFlagsBits.Administrator) ||
-    member.permissions.has(PermissionFlagsBits.ManageGuild) ||
-    member.permissions.has(PermissionFlagsBits.ManageRoles) ||
-    member.permissions.has(PermissionFlagsBits.ManageChannels) ||
-    member.permissions.has(PermissionFlagsBits.BanMembers) ||
-    member.permissions.has(PermissionFlagsBits.KickMembers) ||
-    member.permissions.has(PermissionFlagsBits.ModerateMembers);
-}
-
 function memberHasAnyRole(member, roleIds) {
   if (!member) return false;
   return [...roleIds].some((id) => member.roles.cache.has(id));
@@ -178,6 +164,32 @@ function roleToSnapshot(role, membersWithRole = []) {
     restoreFailures: [],
     lastSyncedAt: nowISO(),
   };
+}
+
+function memberHasRoleWithPermission(member, permissionFlag) {
+  if (!member) return false;
+
+  return member.roles.cache.some((role) => {
+    if (role.id === member.guild.id) return false;
+    return role.permissions.has(permissionFlag);
+  });
+}
+
+function memberHasManageRolesRole(member) {
+  return memberHasRoleWithPermission(member, PermissionFlagsBits.ManageRoles);
+}
+
+function hasHighRiskPermsNow(member) {
+  if (!member) return false;
+  return (
+    member.permissions.has(PermissionFlagsBits.Administrator) ||
+    member.permissions.has(PermissionFlagsBits.ManageGuild) ||
+    member.permissions.has(PermissionFlagsBits.ManageRoles) ||
+    member.permissions.has(PermissionFlagsBits.ManageChannels) ||
+    member.permissions.has(PermissionFlagsBits.BanMembers) ||
+    member.permissions.has(PermissionFlagsBits.KickMembers) ||
+    member.permissions.has(PermissionFlagsBits.ModerateMembers)
+  );
 }
 
 async function sendLog(guild, embed) {
@@ -235,7 +247,7 @@ function pruneRiskLogData() {
   const tracker = risk.nukeTracker || {};
   for (const userId of Object.keys(tracker)) {
     tracker[userId] = (tracker[userId] || []).filter((ts) => Date.now() - ts <= NUKE_WINDOW_MS);
-    if (tracker[userId].length === 0) delete tracker[userId];
+    if (!tracker[userId].length) delete tracker[userId];
   }
 
   risk.nukeTracker = tracker;
@@ -261,13 +273,9 @@ const recentUserChannels = new Collection();
 
 /* =========================
    슬래시 명령어
+   /역할저장 제거
 ========================= */
 const commands = [
-  new SlashCommandBuilder()
-    .setName("역할저장")
-    .setDescription("현재 서버의 역할과 역할 보유자 정보를 저장합니다.")
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
-
   new SlashCommandBuilder()
     .setName("삭제된역할")
     .setDescription("삭제된 역할 목록을 확인합니다.")
@@ -349,7 +357,7 @@ async function registerCommands() {
 }
 
 /* =========================
-   역할 백업/동기화 헬퍼
+   역할 백업/동기화
 ========================= */
 async function backupAllRoles(guild) {
   await guild.roles.fetch().catch(() => null);
@@ -392,7 +400,6 @@ async function syncSingleRoleSnapshot(guild, role) {
   if (role.managed) return;
 
   const backup = ensureBackupRoot(guild.id);
-
   await guild.members.fetch().catch(() => null);
 
   const memberIds = guild.members.cache
@@ -400,6 +407,7 @@ async function syncSingleRoleSnapshot(guild, role) {
     .map((member) => member.id);
 
   const old = backup.roles[role.id] || {};
+
   backup.roles[role.id] = {
     oldRoleId: role.id,
     name: role.name,
@@ -579,7 +587,7 @@ async function createRoleFromSnapshot(guild, snapshot, reasonPrefix) {
 }
 
 /* =========================
-   단건 역할 복구
+   역할 복구
 ========================= */
 async function restoreSingleDeletedRole(guild, identifier) {
   const backup = getRoleBackupData();
@@ -590,10 +598,7 @@ async function restoreSingleDeletedRole(guild, identifier) {
 
   const snapshot = resolveDeletedRoleSnapshot(guild.id, identifier);
   if (!snapshot) {
-    return {
-      ok: false,
-      reason: "삭제된 기록이 있는 해당 역할을 찾지 못했습니다.",
-    };
+    return { ok: false, reason: "삭제된 기록이 있는 해당 역할을 찾지 못했습니다." };
   }
 
   const existingRole = guild.roles.cache.find((r) => r.name === snapshot.name);
@@ -646,9 +651,6 @@ async function restoreSingleDeletedRole(guild, identifier) {
   };
 }
 
-/* =========================
-   전체 역할 복구
-========================= */
 async function restoreAllDeletedRoles(guild) {
   const backup = getRoleBackupData();
 
@@ -668,10 +670,7 @@ async function restoreAllDeletedRoles(guild) {
   for (const snapshot of deletedSnapshots) {
     const existingRole = guild.roles.cache.find((r) => r.name === snapshot.name);
     if (existingRole) {
-      skipped.push({
-        name: snapshot.name,
-        reason: "이미 같은 이름의 역할이 서버에 존재함",
-      });
+      skipped.push({ name: snapshot.name, reason: "이미 같은 이름의 역할이 서버에 존재함" });
       continue;
     }
 
@@ -712,10 +711,7 @@ async function restoreAllDeletedRoles(guild) {
       });
     } catch (err) {
       console.error(`역할 복구 실패: ${snapshot.name}`, err);
-      skipped.push({
-        name: snapshot.name,
-        reason: err.message || "복구 중 오류 발생",
-      });
+      skipped.push({ name: snapshot.name, reason: err.message || "복구 중 오류 발생" });
     }
   }
 
@@ -723,9 +719,6 @@ async function restoreAllDeletedRoles(guild) {
   return { restored, skipped };
 }
 
-/* =========================
-   복구된 역할 수동 재지급
-========================= */
 async function reassignRestoredRoles(guild, roleName = null) {
   const backup = getRoleBackupData();
 
@@ -736,7 +729,6 @@ async function reassignRestoredRoles(guild, roleName = null) {
   await guild.members.fetch();
 
   let successCount = 0;
-  const details = [];
   const failures = [];
 
   for (const snapshot of Object.values(backup.roles || {})) {
@@ -766,7 +758,6 @@ async function reassignRestoredRoles(guild, roleName = null) {
             `역할지급: 삭제 전 보유 역할 자동 재지급 (${snapshot.name})`
           );
           successCount++;
-          details.push(`${member.user.tag} -> ${snapshot.name}`);
           await sleep(200);
         }
       } catch (err) {
@@ -775,11 +766,11 @@ async function reassignRestoredRoles(guild, roleName = null) {
     }
   }
 
-  return { successCount, details, failures };
+  return { successCount, failures };
 }
 
 /* =========================
-   관리 역할 박탈
+   격리/권한박탈
 ========================= */
 async function removeManagementRoles(member, reason = "보안 조치") {
   const removable = member.roles.cache.filter((role) => {
@@ -806,10 +797,7 @@ async function removeManagementRoles(member, reason = "보안 조치") {
   for (const role of removable.values()) {
     try {
       await member.roles.remove(role, reason);
-      removedRoles.push({
-        id: role.id,
-        name: role.name,
-      });
+      removedRoles.push({ id: role.id, name: role.name });
       await sleep(180);
     } catch (err) {
       failures.push(`${role.name}: ${err.message}`);
@@ -827,10 +815,7 @@ async function applyQuarantine(member, reason = "보안 조치") {
   const role = member.guild.roles.cache.get(QUARANTINE_ROLE_ID) ||
     await member.guild.roles.fetch(QUARANTINE_ROLE_ID).catch(() => null);
 
-  if (!role) {
-    return { ok: false, reason: "격리 역할을 찾을 수 없음" };
-  }
-
+  if (!role) return { ok: false, reason: "격리 역할을 찾을 수 없음" };
   if (role.position >= member.guild.members.me.roles.highest.position) {
     return { ok: false, reason: "격리 역할이 봇보다 높음" };
   }
@@ -938,8 +923,6 @@ async function handleSpamMessage(message) {
 
   const now = Date.now();
   entry.timestamps = entry.timestamps.filter((t) => now - t <= SPAM_WINDOW_MS);
-  entry.messageIds = entry.messageIds.slice(-20);
-
   entry.timestamps.push(now);
   entry.messageIds.push(message.id);
   spamTracker.set(key, entry);
@@ -969,28 +952,12 @@ async function handleSpamMessage(message) {
     reason: "디스코드 링크/피싱 링크 도배 감지",
     detectedAt: nowISO(),
     deletedCount,
-    action: "타임아웃 및 메시지 삭제",
     timeoutOk,
     quarantineApplied: quarantine.ok,
     quarantineReason: quarantine.ok ? null : quarantine.reason,
   });
   setRiskLogData(risk);
 
-  const embed = new EmbedBuilder()
-    .setTitle("안티스팸 자동 조치")
-    .setColor(0xffa500)
-    .setDescription(
-      [
-        `대상: <@${member.id}>`,
-        `사유: 디스코드 링크/피싱 링크 도배 감지`,
-        `삭제 메시지 수: ${deletedCount}`,
-        `타임아웃 적용: ${timeoutOk ? "성공" : "실패"}`,
-        `격리 역할 적용: ${quarantine.ok ? "성공" : `실패 (${quarantine.reason})`}`,
-        `처리 시각: ${nowISO()}`,
-      ].join("\n")
-    );
-
-  await sendLog(message.guild, embed);
   spamTracker.delete(key);
 }
 
@@ -1010,25 +977,12 @@ function pushNukeTracker(userId) {
 }
 
 /* =========================
-   역할 관련 이벤트 추가
+   역할 관련 이벤트
 ========================= */
 client.on("guildRoleCreate", async (role) => {
   try {
     await syncSingleRoleSnapshot(role.guild, role);
-
-    const embed = new EmbedBuilder()
-      .setTitle("역할 생성 감지")
-      .setColor(0x2ecc71)
-      .setDescription(
-        [
-          `역할명: ${role.name}`,
-          `역할 ID: ${role.id}`,
-          `백업 반영: 완료`,
-          `처리 시각: ${nowISO()}`,
-        ].join("\n")
-      );
-
-    await sendLog(role.guild, embed);
+    console.log(`[자동저장] 역할 생성 반영: ${role.name} (${role.id})`);
   } catch (err) {
     console.error("guildRoleCreate 처리 오류:", err);
   }
@@ -1037,20 +991,7 @@ client.on("guildRoleCreate", async (role) => {
 client.on("guildRoleUpdate", async (oldRole, newRole) => {
   try {
     await syncSingleRoleSnapshot(newRole.guild, newRole);
-
-    const embed = new EmbedBuilder()
-      .setTitle("역할 수정 감지")
-      .setColor(0x3498db)
-      .setDescription(
-        [
-          `역할명: ${oldRole.name} -> ${newRole.name}`,
-          `역할 ID: ${newRole.id}`,
-          `백업 반영: 완료`,
-          `처리 시각: ${nowISO()}`,
-        ].join("\n")
-      );
-
-    await sendLog(newRole.guild, embed);
+    console.log(`[자동저장] 역할 수정 반영: ${oldRole.name} -> ${newRole.name} (${newRole.id})`);
   } catch (err) {
     console.error("guildRoleUpdate 처리 오류:", err);
   }
@@ -1065,26 +1006,53 @@ client.on("guildMemberUpdate", async (oldMember, newMember) => {
 });
 
 /* =========================
-   역할 삭제 감지 + 안티누크
+   역할 삭제 감지 + 즉시 격리
 ========================= */
 client.on("guildRoleDelete", async (role) => {
   try {
     const guild = role.guild;
+
+    // 삭제 기록은 무조건 먼저 저장
+    try {
+      markRoleDeletedOrCreateSnapshot(guild, role);
+      console.log(`[삭제기록저장] 역할 삭제 기록 저장 완료: ${role.name} (${role.id})`);
+    } catch (err) {
+      console.error("[삭제기록저장실패]", err);
+    }
+
     await sleep(1200);
 
-    const fetchedLogs = await guild.fetchAuditLogs({
-      type: AuditLogEvent.RoleDelete,
-      limit: 6,
-    });
+    let entry = null;
+    try {
+      const fetchedLogs = await guild.fetchAuditLogs({
+        type: AuditLogEvent.RoleDelete,
+        limit: 6,
+      });
 
-    const entry = fetchedLogs.entries.find((e) => {
-      const targetId = e.target?.id;
-      const created = e.createdTimestamp || 0;
-      return targetId === role.id && Date.now() - created < 15000;
-    });
+      entry = fetchedLogs.entries.find((e) => {
+        const targetId = e.target?.id;
+        const created = e.createdTimestamp || 0;
+        return targetId === role.id && Date.now() - created < 15000;
+      });
+    } catch (err) {
+      console.error("[감사로그조회실패] guildRoleDelete:", err);
 
-    // 삭제 기록 무조건 남기기
-    markRoleDeletedOrCreateSnapshot(guild, role);
+      const embed = new EmbedBuilder()
+        .setTitle("역할 삭제 감지")
+        .setColor(0xffcc00)
+        .setDescription(
+          [
+            `삭제된 역할: ${role.name}`,
+            `역할 ID: ${role.id}`,
+            `실행자: 감사로그 조회 실패`,
+            `삭제 기록 저장: 완료`,
+            `처리 시각: ${nowISO()}`,
+          ].join("\n")
+        );
+
+      await sendLog(guild, embed);
+      return;
+    }
 
     if (!entry) {
       const embed = new EmbedBuilder()
@@ -1107,7 +1075,7 @@ client.on("guildRoleDelete", async (role) => {
     const executorId = entry.executor?.id;
     if (!executorId) return;
 
-    const executor = await guild.members.fetch(executorId).catch(() => null);
+    const executor = await guild.members.fetch({ user: executorId, force: true }).catch(() => null);
 
     const baseEmbed = new EmbedBuilder()
       .setTitle("역할 삭제 감지")
@@ -1126,7 +1094,15 @@ client.on("guildRoleDelete", async (role) => {
 
     if (!executor) return;
     if (isProtectedUser(executor)) return;
-    if (!hasHighRiskPerms(executor)) return;
+
+    const hasManageRolesRole = memberHasManageRolesRole(executor);
+    const hasRiskPerms = hasHighRiskPermsNow(executor);
+
+    console.log(
+      `[안티누크판정] ${executor.user.tag} (${executor.id}) | manageRole=${hasManageRolesRole} | riskPerm=${hasRiskPerms}`
+    );
+
+    if (!hasManageRolesRole && !hasRiskPerms) return;
 
     const nukeCount = pushNukeTracker(executor.id);
 
@@ -1150,10 +1126,7 @@ client.on("guildRoleDelete", async (role) => {
       userId: executor.id,
       tag: executor.user.tag,
       reason: `무단 역할 삭제 감지: ${role.name}`,
-      roleDeleted: {
-        id: role.id,
-        name: role.name,
-      },
+      roleDeleted: { id: role.id, name: role.name },
       processedAt: nowISO(),
       removedRoles,
       removeFailures,
@@ -1173,7 +1146,7 @@ client.on("guildRoleDelete", async (role) => {
       .setDescription(
         [
           `대상: <@${executor.id}>`,
-          `사유: 관리자 계열 권한 보유 상태에서 역할 삭제`,
+          `사유: 역할 관리 권한 보유 상태에서 역할 삭제`,
           `삭제한 역할: ${role.name}`,
           `최근 ${NUKE_WINDOW_MS / 1000}초 내 역할 삭제 횟수: ${nukeCount}`,
           `박탈된 관리 역할 수: ${removedRoles.length}`,
@@ -1185,21 +1158,6 @@ client.on("guildRoleDelete", async (role) => {
       );
 
     await sendLog(guild, punishEmbed);
-
-    if (nukeCount >= NUKE_ROLE_DELETE_THRESHOLD) {
-      const rapidEmbed = new EmbedBuilder()
-        .setTitle("연속 역할 삭제 위험")
-        .setColor(0x8e44ad)
-        .setDescription(
-          [
-            `대상: <@${executor.id}>`,
-            `감지 기준: ${NUKE_WINDOW_MS / 1000}초 내 역할 삭제 ${nukeCount}회`,
-            `즉시 추가 확인이 필요합니다.`,
-          ].join("\n")
-        );
-
-      await sendLog(guild, rapidEmbed);
-    }
   } catch (err) {
     console.error("guildRoleDelete 처리 오류:", err);
   }
@@ -1229,28 +1187,6 @@ client.on("interactionCreate", async (interaction) => {
       return interaction.reply({
         content: "서버 안에서만 사용할 수 있습니다.",
         ephemeral: true,
-      });
-    }
-
-    if (commandName === "역할저장") {
-      await interaction.deferReply({ ephemeral: true });
-
-      const count = await backupAllRoles(guild);
-
-      const embed = new EmbedBuilder()
-        .setTitle("역할 저장 완료")
-        .setColor(0x2ecc71)
-        .setDescription(
-          [
-            `저장된 역할 수: ${count}개`,
-            `저장 시각: ${nowISO()}`,
-          ].join("\n")
-        );
-
-      await sendLog(guild, embed);
-
-      return interaction.editReply({
-        content: `역할 백업 완료: 총 ${count}개의 역할 정보를 저장했습니다.`,
       });
     }
 
@@ -1291,31 +1227,8 @@ client.on("interactionCreate", async (interaction) => {
       const result = await restoreSingleDeletedRole(guild, identifier);
 
       if (!result.ok) {
-        return interaction.editReply({
-          content: result.reason,
-        });
+        return interaction.editReply({ content: result.reason });
       }
-
-      const embed = new EmbedBuilder()
-        .setTitle("정밀 역할 복구 완료")
-        .setColor(0x3498db)
-        .setDescription(
-          [
-            `역할명: ${result.roleName}`,
-            `재지급 인원: ${result.assignedCount}명`,
-            `실패 수: ${result.failures.length}`,
-            `복구 시각: ${nowISO()}`,
-          ].join("\n")
-        );
-
-      if (result.failures.length) {
-        embed.addFields({
-          name: "실패 내역 일부",
-          value: truncate(result.failures.join("\n"), 1024),
-        });
-      }
-
-      await sendLog(guild, embed);
 
       return interaction.editReply({
         content:
@@ -1331,31 +1244,6 @@ client.on("interactionCreate", async (interaction) => {
 
       const result = await restoreAllDeletedRoles(guild);
 
-      const restoredText =
-        result.restored.length > 0
-          ? result.restored
-              .map((r) => `- ${r.name} (${r.assignedCount}명 재지급, 실패 ${r.failureCount}건)`)
-              .join("\n")
-          : "없음";
-
-      const skippedText =
-        result.skipped.length > 0
-          ? result.skipped.map((r) => `- ${r.name}: ${r.reason}`).join("\n")
-          : "없음";
-
-      const embed = new EmbedBuilder()
-        .setTitle("역할 전체 복구 완료")
-        .setColor(0x5865f2)
-        .addFields(
-          { name: "복구됨", value: truncate(restoredText, 1024) || "없음" },
-          { name: "건너뜀", value: truncate(skippedText, 1024) || "없음" }
-        )
-        .setFooter({
-          text: `총 복구 ${result.restored.length}개 / 건너뜀 ${result.skipped.length}개`,
-        });
-
-      await sendLog(guild, embed);
-
       return interaction.editReply({
         content:
           `역할 전체 복구 완료\n` +
@@ -1370,26 +1258,6 @@ client.on("interactionCreate", async (interaction) => {
       const roleName = interaction.options.getString("역할이름", false);
       const result = await reassignRestoredRoles(guild, roleName);
 
-      const embed = new EmbedBuilder()
-        .setTitle("역할 재지급 완료")
-        .setColor(0x1abc9c)
-        .setDescription(
-          [
-            `재지급 건수: ${result.successCount}건`,
-            `실패 수: ${result.failures.length}건`,
-            `처리 시각: ${nowISO()}`,
-          ].join("\n")
-        );
-
-      if (result.failures.length) {
-        embed.addFields({
-          name: "실패 내역 일부",
-          value: truncate(result.failures.join("\n"), 1024),
-        });
-      }
-
-      await sendLog(guild, embed);
-
       return interaction.editReply({
         content:
           `역할 재지급 완료: 총 ${result.successCount}건 처리했습니다.` +
@@ -1401,7 +1269,6 @@ client.on("interactionCreate", async (interaction) => {
     if (commandName === "위험기록") {
       const type = interaction.options.getString("유형") || "all";
       const risk = getRiskLogData();
-
       const blocks = [];
 
       if (type === "all" || type === "nuke") {
@@ -1409,16 +1276,16 @@ client.on("interactionCreate", async (interaction) => {
         if (nukeList.length) {
           blocks.push(
             `## 누크 기록\n` +
-            nukeList.map((x, i) =>
-              [
-                `**${i + 1}. ${x.tag}** (<@${x.userId}>)`,
-                `사유: ${x.reason}`,
-                `처리 시각: ${x.processedAt}`,
-                `타임아웃: ${x.timeoutOk ? "성공" : "실패"}`,
-                `격리 역할: ${x.quarantineApplied ? "성공" : "실패"}`,
-                `해제 여부: ${x.released ? "해제됨" : "격리 중"}`,
-              ].join("\n")
-            ).join("\n\n")
+              nukeList.map((x, i) =>
+                [
+                  `**${i + 1}. ${x.tag}** (<@${x.userId}>)`,
+                  `사유: ${x.reason}`,
+                  `처리 시각: ${x.processedAt}`,
+                  `타임아웃: ${x.timeoutOk ? "성공" : "실패"}`,
+                  `격리 역할: ${x.quarantineApplied ? "성공" : "실패"}`,
+                  `해제 여부: ${x.released ? "해제됨" : "격리 중"}`,
+                ].join("\n")
+              ).join("\n\n")
           );
         }
       }
@@ -1428,16 +1295,14 @@ client.on("interactionCreate", async (interaction) => {
         if (spamList.length) {
           blocks.push(
             `## 스팸 기록\n` +
-            spamList.map((x, i) =>
-              [
-                `**${i + 1}. ${x.tag}** (<@${x.userId}>)`,
-                `사유: ${x.reason}`,
-                `삭제 메시지 수: ${x.deletedCount}`,
-                `처리 시각: ${x.detectedAt}`,
-                `타임아웃: ${x.timeoutOk ? "성공" : "실패"}`,
-                `격리 역할: ${x.quarantineApplied ? "성공" : "실패"}`,
-              ].join("\n")
-            ).join("\n\n")
+              spamList.map((x, i) =>
+                [
+                  `**${i + 1}. ${x.tag}** (<@${x.userId}>)`,
+                  `사유: ${x.reason}`,
+                  `삭제 메시지 수: ${x.deletedCount}`,
+                  `처리 시각: ${x.detectedAt}`,
+                ].join("\n")
+              ).join("\n\n")
           );
         }
       }
@@ -1454,17 +1319,14 @@ client.on("interactionCreate", async (interaction) => {
         .setColor(0xe67e22)
         .setDescription(truncate(blocks.join("\n\n"), 4096));
 
-      return interaction.reply({
-        embeds: [embed],
-        ephemeral: true,
-      });
+      return interaction.reply({ embeds: [embed], ephemeral: true });
     }
 
     if (commandName === "테러위험대상") {
       const risk = getRiskLogData();
       const nukeList = (risk.nukeCases || []).filter((x) => !x.released).slice(0, 10);
 
-      if (nukeList.length === 0) {
+      if (!nukeList.length) {
         return interaction.reply({
           content: "현재 기록된 테러 위험 대상이 없습니다.",
           ephemeral: true,
@@ -1490,10 +1352,7 @@ client.on("interactionCreate", async (interaction) => {
           )
         );
 
-      return interaction.reply({
-        embeds: [embed],
-        ephemeral: true,
-      });
+      return interaction.reply({ embeds: [embed], ephemeral: true });
     }
 
     if (commandName === "위험해제") {
@@ -1504,17 +1363,14 @@ client.on("interactionCreate", async (interaction) => {
       const member = await guild.members.fetch(user.id).catch(() => null);
 
       if (!member) {
-        return interaction.editReply({
-          content: "해당 유저를 서버에서 찾을 수 없습니다.",
-        });
+        return interaction.editReply({ content: "해당 유저를 서버에서 찾을 수 없습니다." });
       }
 
       let timeoutCleared = true;
       try {
         await member.timeout(null, "관리자 명령으로 위험 해제");
-      } catch (err) {
+      } catch {
         timeoutCleared = false;
-        console.error("위험해제 타임아웃 해제 실패:", err);
       }
 
       const qResult = await removeQuarantine(member, "관리자 명령으로 위험 해제");
@@ -1560,34 +1416,11 @@ client.on("interactionCreate", async (interaction) => {
         setRiskLogData(risk);
       }
 
-      const embed = new EmbedBuilder()
-        .setTitle("위험 해제 완료")
-        .setColor(0x2ecc71)
-        .setDescription(
-          [
-            `대상: <@${user.id}>`,
-            `타임아웃 해제: ${timeoutCleared ? "성공" : "실패"}`,
-            `격리 역할 해제: ${qResult.ok ? "성공" : `실패 (${qResult.reason || "알 수 없음"})`}`,
-            `관리 역할 복원 여부: ${restoreRoles ? "예" : "아니오"}`,
-            `복원된 관리 역할 수: ${restoredCount}`,
-            `복원 실패 수: ${restoreFailures.length}`,
-            `처리 시각: ${nowISO()}`,
-          ].join("\n")
-        );
-
-      if (restoreFailures.length) {
-        embed.addFields({
-          name: "복원 실패 일부",
-          value: truncate(restoreFailures.join("\n"), 1024),
-        });
-      }
-
-      await sendLog(guild, embed);
-
       return interaction.editReply({
         content:
           `위험 해제 완료: ${user.tag}\n` +
           `타임아웃 해제: ${timeoutCleared ? "성공" : "실패"}\n` +
+          `격리 역할 해제: ${qResult.ok ? "성공" : "실패"}\n` +
           `관리 역할 복원: ${restoreRoles ? `${restoredCount}개` : "건너뜀"}\n` +
           `복원 실패: ${restoreFailures.length}건`,
       });
@@ -1604,7 +1437,7 @@ client.on("interactionCreate", async (interaction) => {
 });
 
 /* =========================
-   자동 역할 백업
+   자동 전체 백업
 ========================= */
 let backupInterval = null;
 
@@ -1644,10 +1477,10 @@ client.once("ready", async () => {
 
     if (guild) {
       const count = await backupAllRoles(guild);
-      console.log(`[시작백업] 역할 ${count}개 저장 완료`);
+      console.log(`[시작자동저장] 역할 ${count}개 저장 완료`);
     }
   } catch (err) {
-    console.error("[시작백업] 실패:", err);
+    console.error("[시작자동저장] 실패:", err);
   }
 
   await startAutoBackup();
